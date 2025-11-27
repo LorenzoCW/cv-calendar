@@ -13,19 +13,33 @@ import {
   doc as firestoreDoc,
 } from "firebase/firestore";
 
+const STORAGE_KEY = "cv-calendar-items";
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const VISIBLE_DAYS = 7;
 
-function formatDateKey(d: Date) {
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+function pad(n: number) {
+  return String(n).padStart(2, "0");
 }
 
-function dayLabel(d: Date) {
+// Format a Date to YYYY-MM-DD using local timezone components
+function formatDateKey(d: Date) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Parse a YYYY-MM-DD dateKey to a local Date at local midnight
+function parseDateKey(dateKey: string) {
+  const [y, m, day] = dateKey.split("-").map(Number);
+  return new Date(y, m - 1, day);
+}
+
+function dayLabelFromKey(dateKey: string) {
+  const d = parseDateKey(dateKey);
   return d.toLocaleDateString(undefined, { weekday: "short", day: "2-digit", month: "short" });
 }
 
-function makeDateBefore(base: Date, daysBefore: number) {
-  return new Date(base.getTime() - daysBefore * MS_PER_DAY);
+function localMidnight(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
 
 function initFirebase() {
@@ -65,7 +79,7 @@ function initFirebase() {
 // Helper to read raw localStorage items
 function readLocalStorageItems() {
   try {
-    const raw = localStorage.getItem("infinite-calendar-items-v1");
+    const raw = localStorage.getItem(STORAGE_KEY);
     return raw ? JSON.parse(raw) : {};
   } catch (e) {
     return {};
@@ -73,13 +87,13 @@ function readLocalStorageItems() {
 }
 
 export default function App() {
-  const today = new Date();
+  const baseLocalMidnight = localMidnight(new Date());
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const [visibleDates] = useState<string[]>(() => {
     const arr: string[] = [];
     for (let i = 0; i < VISIBLE_DAYS; i++) {
-      const d = makeDateBefore(today, i);
+      const d = new Date(baseLocalMidnight.getFullYear(), baseLocalMidnight.getMonth(), baseLocalMidnight.getDate() - i);
       arr.push(formatDateKey(d));
     }
     return arr;
@@ -88,7 +102,6 @@ export default function App() {
   // itemsMap stores arrays of items with optional `pending` boolean
   const [itemsMap, setItemsMap] = useState<Record<string, { id: string; title: string; link: string; createdAtMs: number; pending?: boolean }[]>>(() => {
     const raw = readLocalStorageItems();
-    // mark local-only items (ids starting with 'local-') as pending
     const mapped: Record<string, any[]> = {};
     for (const dk of Object.keys(raw)) {
       mapped[dk] = (raw[dk] || []).map((it: any) => ({
@@ -126,7 +139,7 @@ export default function App() {
         const fromServer: Record<string, { id: string; title: string; link: string; createdAtMs: number }[]> = {};
         snap.forEach((doc) => {
           const data: any = doc.data();
-          const dateKey = data.dateKey || formatDateKey(new Date((data.createdAtMs) || Date.now()));
+          const dateKey = data.dateKey || formatDateKey(new Date(data.createdAtMs || Date.now()));
           const rec = {
             id: doc.id,
             title: data.title || "",
@@ -140,18 +153,14 @@ export default function App() {
         setItemsMap((prev) => {
           const newMap = { ...prev };
           for (const dk of visibleDates) {
-            // start with any local items for dk
-            const localArr = (newMap[dk] || []).filter((i: any) => i.id && i.id.startsWith("local-"));
+            const localArr = (newMap[dk] || []).filter((i: any) => i.id && String(i.id).startsWith("local-"));
             const serverArr = fromServer[dk] || [];
 
-            // Remove local optimistic duplicates if server has same createdAtMs + title (best-effort)
             const serverKeys = new Set(serverArr.map((s) => `${s.title}::${s.createdAtMs}`));
             const filteredLocal = localArr.filter((l: any) => !serverKeys.has(`${l.title}::${l.createdAtMs}`));
 
-            // mark server items as not pending
             const normalizedServer = serverArr.map((s) => ({ ...s, pending: false }));
 
-            // merge: server items (trusted) first, then leftover local pending items
             const merged = [...normalizedServer, ...filteredLocal];
             merged.sort((a, b) => (a.createdAtMs || 0) - (b.createdAtMs || 0));
 
@@ -173,7 +182,6 @@ export default function App() {
     if (!db) return;
 
     async function uploadPending() {
-      // gather pending items
       const pendingEntries: { dateKey: string; item: any }[] = [];
       for (const dk of Object.keys(itemsMap)) {
         for (const it of itemsMap[dk]) {
@@ -196,14 +204,12 @@ export default function App() {
             createdAtServer: serverTimestamp(),
           });
 
-          // replace local optimistic id with server id and clear pending flag
           setItemsMap((prev) => {
             const arr = (prev[dateKey] || []).map((it) => (it.id === item.id ? { ...it, id: docRef.id, pending: false } : it));
             return { ...prev, [dateKey]: arr };
           });
         } catch (e) {
           console.warn("Failed to upload pending item to Firestore:", e, item);
-          // keep pending true so user sees it's not uploaded
         }
       }
     }
@@ -221,7 +227,7 @@ export default function App() {
           toSave[dk] = arr.map((it) => ({ id: it.id, title: it.title, link: it.link, createdAtMs: it.createdAtMs }));
         }
       }
-      localStorage.setItem("infinite-calendar-items-v1", JSON.stringify(toSave));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
     } catch (e) {
       console.warn("Failed to save to localStorage:", e);
     }
@@ -250,14 +256,12 @@ export default function App() {
         createdAtServer: serverTimestamp(),
       });
 
-      // replace local optimistic id with server id and clear pending flag
       setItemsMap((prev) => {
         const arr = (prev[dateKey] || []).map((it) => (it.id === localId ? { ...it, id: docRef.id, pending: false } : it));
         return { ...prev, [dateKey]: arr };
       });
     } catch (e) {
       console.warn("Failed to add item to Firestore:", e);
-      // keep local item with pending: true so user sees it's not yet in server
     }
   }
 
@@ -265,7 +269,6 @@ export default function App() {
   async function deleteItem(dateKey: string, id: string) {
     if (!id) return;
 
-    // If it's a local-only item just remove it locally
     if (String(id).startsWith("local-")) {
       setItemsMap((prev) => {
         const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
@@ -276,11 +279,9 @@ export default function App() {
       return;
     }
 
-    // If we have db, try to delete from Firestore first; if success remove locally.
     if (db) {
       try {
         await deleteDoc(firestoreDoc(db, "items", id));
-        // removed from server, now remove locally
         setItemsMap((prev) => {
           const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
           const newMap = { ...prev };
@@ -289,10 +290,8 @@ export default function App() {
         });
       } catch (e) {
         console.warn("Failed to delete item from Firestore:", e);
-        // keep local copy so user can retry deletion manually (or we could remove locally anyway)
       }
     } else {
-      // no db configured — remove locally
       setItemsMap((prev) => {
         const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
         const newMap = { ...prev };
@@ -304,7 +303,7 @@ export default function App() {
 
   // helper to create a debug JSON string of raw localStorage data
   function debugLocalStorageJSON() {
-    const raw = localStorage.getItem("infinite-calendar-items-v1");
+    const raw = localStorage.getItem(STORAGE_KEY);
     try {
       return raw ? JSON.stringify(JSON.parse(raw), null, 2) : "{}";
     } catch (e) {
@@ -315,12 +314,11 @@ export default function App() {
   // clear localStorage button handler: removes localStorage entry and also removes local-only items from UI state
   function clearLocalStorageDebug() {
     try {
-      localStorage.removeItem("infinite-calendar-items-v1");
+      localStorage.removeItem(STORAGE_KEY);
     } catch (e) {
       console.warn("Failed to clear localStorage:", e);
     }
 
-    // remove local-only items (ids starting with local-) from state — keep server items
     setItemsMap((prev) => {
       const newMap: Record<string, any[]> = {};
       for (const dk of Object.keys(prev)) {
@@ -364,8 +362,8 @@ export default function App() {
             return (
               <div key={dateKey} className="day-column" style={{ minWidth: 235, background: "#fafafa", borderRadius: 8, padding: 10 }}>
                 <div className="day-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                  <div style={{ fontWeight: 600 }}>{dayLabel(new Date(dateKey + "T00:00:00"))}</div>
-                  <div style={{ fontWeight: 700 }}>{count}/5 {count >= 5 ? "✅" : ""}</div>
+                  <div style={{ fontWeight: 600 }}>{dayLabelFromKey(dateKey)}</div>
+                  <div style={{ fontWeight: 700 }}>{count >= 5 ? "✅" : ""} {count}/5</div>
                 </div>
 
                 <div style={{ minHeight: 80 }}>
