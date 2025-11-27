@@ -9,6 +9,8 @@ import {
   getDocs,
   orderBy,
   serverTimestamp,
+  deleteDoc,
+  doc as firestoreDoc,
 } from "firebase/firestore";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -74,7 +76,7 @@ export default function App() {
   const today = new Date();
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const [visibleDates, setVisibleDates] = useState<string[]>(() => {
+  const [visibleDates] = useState<string[]>(() => {
     const arr: string[] = [];
     for (let i = 0; i < VISIBLE_DAYS; i++) {
       const d = makeDateBefore(today, i);
@@ -139,7 +141,7 @@ export default function App() {
           const newMap = { ...prev };
           for (const dk of visibleDates) {
             // start with any local items for dk
-            const localArr = (newMap[dk] || []).filter((i: any) => !(i.id && !i.id.startsWith("local-")) || i.id.startsWith("local-"));
+            const localArr = (newMap[dk] || []).filter((i: any) => i.id && i.id.startsWith("local-"));
             const serverArr = fromServer[dk] || [];
 
             // Remove local optimistic duplicates if server has same createdAtMs + title (best-effort)
@@ -149,7 +151,7 @@ export default function App() {
             // mark server items as not pending
             const normalizedServer = serverArr.map((s) => ({ ...s, pending: false }));
 
-            // merge: server items (trusted) first, then leftover local pending items — already ordered by createdAtMs
+            // merge: server items (trusted) first, then leftover local pending items
             const merged = [...normalizedServer, ...filteredLocal];
             merged.sort((a, b) => (a.createdAtMs || 0) - (b.createdAtMs || 0));
 
@@ -166,13 +168,58 @@ export default function App() {
     fetchVisibleDays();
   }, [db, visibleDates]);
 
-  // persist local copy whenever itemsMap changes
+  // When db becomes available, attempt to upload pending local items automatically
+  useEffect(() => {
+    if (!db) return;
+
+    async function uploadPending() {
+      // gather pending items
+      const pendingEntries: { dateKey: string; item: any }[] = [];
+      for (const dk of Object.keys(itemsMap)) {
+        for (const it of itemsMap[dk]) {
+          if (it.id && String(it.id).startsWith("local-")) {
+            pendingEntries.push({ dateKey: dk, item: it });
+          }
+        }
+      }
+
+      if (pendingEntries.length === 0) return;
+
+      for (const entry of pendingEntries) {
+        const { dateKey, item } = entry;
+        try {
+          const docRef = await addDoc(collection(db, "items"), {
+            title: item.title,
+            link: item.link,
+            dateKey,
+            createdAtMs: item.createdAtMs,
+            createdAtServer: serverTimestamp(),
+          });
+
+          // replace local optimistic id with server id and clear pending flag
+          setItemsMap((prev) => {
+            const arr = (prev[dateKey] || []).map((it) => (it.id === item.id ? { ...it, id: docRef.id, pending: false } : it));
+            return { ...prev, [dateKey]: arr };
+          });
+        } catch (e) {
+          console.warn("Failed to upload pending item to Firestore:", e, item);
+          // keep pending true so user sees it's not uploaded
+        }
+      }
+    }
+
+    uploadPending();
+  }, [db, itemsMap]);
+
+  // persist local copy whenever itemsMap changes — but skip days with zero items
   useEffect(() => {
     try {
-      // Only persist the shape { dateKey: [ {id,title,link,createdAtMs} ] }
       const toSave: Record<string, any[]> = {};
       for (const dk of Object.keys(itemsMap)) {
-        toSave[dk] = itemsMap[dk].map((it) => ({ id: it.id, title: it.title, link: it.link, createdAtMs: it.createdAtMs }));
+        const arr = itemsMap[dk];
+        if (arr && arr.length > 0) {
+          toSave[dk] = arr.map((it) => ({ id: it.id, title: it.title, link: it.link, createdAtMs: it.createdAtMs }));
+        }
       }
       localStorage.setItem("infinite-calendar-items-v1", JSON.stringify(toSave));
     } catch (e) {
@@ -214,11 +261,45 @@ export default function App() {
     }
   }
 
-  function removeItem(dateKey: string, id: string) {
-    setItemsMap((prev) => {
-      const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
-      return { ...prev, [dateKey]: arr };
-    });
+  // delete item both locally and from Firestore (when it has a server id)
+  async function deleteItem(dateKey: string, id: string) {
+    if (!id) return;
+
+    // If it's a local-only item just remove it locally
+    if (String(id).startsWith("local-")) {
+      setItemsMap((prev) => {
+        const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
+        const newMap = { ...prev };
+        if (arr.length > 0) newMap[dateKey] = arr; else delete newMap[dateKey];
+        return newMap;
+      });
+      return;
+    }
+
+    // If we have db, try to delete from Firestore first; if success remove locally.
+    if (db) {
+      try {
+        await deleteDoc(firestoreDoc(db, "items", id));
+        // removed from server, now remove locally
+        setItemsMap((prev) => {
+          const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
+          const newMap = { ...prev };
+          if (arr.length > 0) newMap[dateKey] = arr; else delete newMap[dateKey];
+          return newMap;
+        });
+      } catch (e) {
+        console.warn("Failed to delete item from Firestore:", e);
+        // keep local copy so user can retry deletion manually (or we could remove locally anyway)
+      }
+    } else {
+      // no db configured — remove locally
+      setItemsMap((prev) => {
+        const arr = (prev[dateKey] || []).filter((it) => it.id !== id);
+        const newMap = { ...prev };
+        if (arr.length > 0) newMap[dateKey] = arr; else delete newMap[dateKey];
+        return newMap;
+      });
+    }
   }
 
   // helper to create a debug JSON string of raw localStorage data
@@ -231,17 +312,37 @@ export default function App() {
     }
   }
 
+  // clear localStorage button handler: removes localStorage entry and also removes local-only items from UI state
+  function clearLocalStorageDebug() {
+    try {
+      localStorage.removeItem("infinite-calendar-items-v1");
+    } catch (e) {
+      console.warn("Failed to clear localStorage:", e);
+    }
+
+    // remove local-only items (ids starting with local-) from state — keep server items
+    setItemsMap((prev) => {
+      const newMap: Record<string, any[]> = {};
+      for (const dk of Object.keys(prev)) {
+        const filtered = prev[dk].filter((it) => !(it.id && String(it.id).startsWith("local-")));
+        if (filtered.length > 0) newMap[dk] = filtered;
+      }
+      return newMap;
+    });
+  }
+
   return (
     <div style={{ padding: 16, height: "100vh", boxSizing: "border-box", display: "flex", flexDirection: "column" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
         <h1 style={{ margin: "0 0 12px 0" }}>Calendário — últimos {VISIBLE_DAYS} dias (novos à esquerda)</h1>
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={() => setShowDebug((s) => !s)} style={{ padding: "6px 10px" }}>Debug: localStorage</button>
+          <button onClick={clearLocalStorageDebug} style={{ padding: "6px 10px" }}>Debug: limpar localStorage</button>
         </div>
       </div>
 
       <div style={{ marginBottom: 8 }}>
-        Itens salvos localmente que ainda não foram confirmados no Firestore aparecem com ⏳. Esta verificação acontece sempre que a página carrega.
+        Itens salvos localmente que ainda não foram confirmados no Firestore aparecem com ⏳. O app tenta enviar automaticamente os itens pendentes quando o Firestore fica disponível.
       </div>
 
       {showDebug ? (
@@ -275,7 +376,7 @@ export default function App() {
                           <div style={{ fontWeight: 600 }}>{it.title}</div>
                           {it.pending ? <span title="Aguardando upload para Firestore">⏳</span> : null}
                         </div>
-                        <button onClick={() => removeItem(dateKey, it.id)} title="Remover" style={{ border: "none", background: "transparent", cursor: "pointer" }}>✖</button>
+                        <button onClick={() => deleteItem(dateKey, it.id)} title="Remover" style={{ border: "none", background: "transparent", cursor: "pointer" }}>✖</button>
                       </div>
                       {it.link ? (
                         <a href={it.link} target="_blank" rel="noreferrer" style={{ fontSize: 13, textDecoration: "underline" }}>{it.link}</a>
