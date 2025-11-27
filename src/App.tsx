@@ -22,12 +22,10 @@ function pad(n: number) {
   return String(n).padStart(2, "0");
 }
 
-// Format a Date to YYYY-MM-DD using local timezone components
 function formatDateKey(d: Date) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-// Parse a YYYY-MM-DD dateKey to a local Date at local midnight
 function parseDateKey(dateKey: string) {
   const [y, m, day] = dateKey.split("-").map(Number);
   return new Date(y, m - 1, day);
@@ -76,7 +74,6 @@ function initFirebase() {
   }
 }
 
-// Helper to read raw localStorage items
 function readLocalStorageItems() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -99,7 +96,6 @@ export default function App() {
     return arr;
   });
 
-  // itemsMap stores arrays of items with optional `pending` boolean
   const [itemsMap, setItemsMap] = useState<Record<string, { id: string; title: string; link: string; createdAtMs: number; pending?: boolean }[]>>(() => {
     const raw = readLocalStorageItems();
     const mapped: Record<string, any[]> = {};
@@ -117,6 +113,8 @@ export default function App() {
 
   const [db, setDb] = useState<any | null>(null);
   const [showDebug, setShowDebug] = useState(false);
+
+  const uploadingRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const firestore = initFirebase();
@@ -177,7 +175,7 @@ export default function App() {
     fetchVisibleDays();
   }, [db, visibleDates]);
 
-  // When db becomes available, attempt to upload pending local items automatically
+  // When db becomes available, attempt to upload pending local items automatically (runs only on db change)
   useEffect(() => {
     if (!db) return;
 
@@ -186,6 +184,7 @@ export default function App() {
       for (const dk of Object.keys(itemsMap)) {
         for (const it of itemsMap[dk]) {
           if (it.id && String(it.id).startsWith("local-")) {
+            if (uploadingRef.current.has(it.id)) continue;
             pendingEntries.push({ dateKey: dk, item: it });
           }
         }
@@ -215,7 +214,7 @@ export default function App() {
     }
 
     uploadPending();
-  }, [db, itemsMap]);
+  }, [db]);
 
   // persist local copy whenever itemsMap changes — but skip days with zero items
   useEffect(() => {
@@ -247,6 +246,7 @@ export default function App() {
 
     if (!db) return;
 
+    uploadingRef.current.add(localId);
     try {
       const docRef = await addDoc(collection(db, "items"), {
         title,
@@ -262,10 +262,11 @@ export default function App() {
       });
     } catch (e) {
       console.warn("Failed to add item to Firestore:", e);
+    } finally {
+      uploadingRef.current.delete(localId);
     }
   }
 
-  // delete item both locally and from Firestore (when it has a server id)
   async function deleteItem(dateKey: string, id: string) {
     if (!id) return;
 
@@ -301,7 +302,6 @@ export default function App() {
     }
   }
 
-  // helper to create a debug JSON string of raw localStorage data
   function debugLocalStorageJSON() {
     const raw = localStorage.getItem(STORAGE_KEY);
     try {
@@ -311,7 +311,6 @@ export default function App() {
     }
   }
 
-  // clear localStorage button handler: removes localStorage entry and also removes local-only items from UI state
   function clearLocalStorageDebug() {
     try {
       localStorage.removeItem(STORAGE_KEY);
